@@ -3,6 +3,7 @@ import json
 import threading
 import pyotp
 import redis
+import time
 
 r = redis.StrictRedis(host='localhost', port=6379, db=0)
 
@@ -14,6 +15,10 @@ def get_token_for_price(price):
 
     real_date = real_date.decode()
     strike = int(round(price / 50.0) * 50)
+
+    print(f"Looking for token with expiry: {real_date}, strike: {strike}")
+    all_keys = [key.decode() for key in r.hkeys("token_data")]
+    print(f"All token keys in Redis (sample 10): {all_keys[:10]}")
 
     for key in r.hkeys("token_data"):
         sym = key.decode()
@@ -38,7 +43,8 @@ def execute_order_for_user(user, symbol, token, price):
             totp=pyotp.TOTP(user['totp']).now()
         )
 
-        if session.get("status") == "Ok":
+        # Check multiple possible status formats
+        if session.get("status") in [True, "Ok", "SUCCESS", "Success"]:
             print(f"[{user['client_id']}] ✅ Logged in. Placing CE order...")
 
             params = {
@@ -59,8 +65,10 @@ def execute_order_for_user(user, symbol, token, price):
 
             response = obj.placeOrder(params)
             print(f"[{user['client_id']}] ✅ CE Order response: {response}")
+
         else:
             print(f"[{user['client_id']}] ❌ Session error: {session}")
+
     except Exception as e:
         print(f"[{user['client_id']}] ❌ Exception at order CE: {e}")
 
@@ -73,12 +81,19 @@ def placeOrder(price):
         return
 
     symbol, token = result
-    threads = [threading.Thread(target=execute_order_for_user, args=(user, symbol, token, price)) for user in users]
 
-    for t in threads: t.start()
-    for t in threads: t.join()
+    threads = []
+    for user in users:
+        t = threading.Thread(target=execute_order_for_user, args=(user, symbol, token, price))
+        threads.append(t)
+        t.start()
+        time.sleep(1)  # Add delay between starts to reduce rate limiting
+
+    for t in threads:
+        t.join()
 
     print("✅ All CE orders processed.")
+
 
 if __name__ == "__main__":
     import sys
