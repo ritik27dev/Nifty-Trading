@@ -7,28 +7,47 @@ import time
 
 r = redis.StrictRedis(host='localhost', port=6379, db=0)
 
-def get_token_for_price(price):
-    real_date = r.hget("date", "expiry")
-    if not real_date:
-        print("❌ Expiry date not found in Redis.")
-        return None
+# def get_token_for_price(price):
+#     real_date = r.hget("date", "expiry")
+#     if not real_date:
+#         print("❌ Expiry date not found in Redis.")
+#         return None
 
-    real_date = real_date.decode()
+#     real_date = real_date.decode()
+#     strike = int(round(price / 50.0) * 50)
+
+#     print(f"Looking for token with expiry: {real_date}, strike: {strike}")
+#     all_keys = [key.decode() for key in r.hkeys("token_data")]
+#     print(f"All token keys in Redis (sample 10): {all_keys[:10]}")
+
+#     for key in r.hkeys("token_data"):
+#         sym = key.decode()
+#         if sym.startswith("NIFTY") and sym.endswith("CE") and real_date in sym and str(strike) in sym:
+#             token = r.hget("token_data", key).decode()
+#             print(f"✅ Found CE token for {sym}: {token}")
+#             return sym, token
+
+#     print(f"❌ CE Token not found for strike {strike} and expiry {real_date}")
+#     return None
+def get_token_for_price(price, expiry):
     strike = int(round(price / 50.0) * 50)
 
-    print(f"Looking for token with expiry: {real_date}, strike: {strike}")
+    print(f"Looking for token with expiry: {expiry}, strike: {strike}")
     all_keys = [key.decode() for key in r.hkeys("token_data")]
     print(f"All token keys in Redis (sample 10): {all_keys[:10]}")
 
     for key in r.hkeys("token_data"):
         sym = key.decode()
-        if sym.startswith("NIFTY") and sym.endswith("CE") and real_date in sym and str(strike) in sym:
+        # Check if token symbol contains the expiry and strike
+        if sym.startswith("NIFTY") and sym.endswith("CE") and expiry in sym and str(strike) in sym:
             token = r.hget("token_data", key).decode()
             print(f"✅ Found CE token for {sym}: {token}")
             return sym, token
 
-    print(f"❌ CE Token not found for strike {strike} and expiry {real_date}")
+    print(f"❌ CE Token not found for strike {strike} and expiry {expiry}")
     return None
+
+
 
 def load_credentials():
     with open('user_credentials.json', 'r') as file:
@@ -72,10 +91,10 @@ def execute_order_for_user(user, symbol, token, price):
     except Exception as e:
         print(f"[{user['client_id']}] ❌ Exception at order CE: {e}")
 
-def placeOrder(price):
-    print(f"🚀 Executing CE order for price: {price}")
+def placeOrder(price, expiry):
+    print(f"🚀 Executing CE order for price: {price} with expiry: {expiry}")
     users = load_credentials()
-    result = get_token_for_price(price)
+    result = get_token_for_price(price, expiry)
     if not result:
         print("⚠️ Aborting CE order due to missing token.")
         return
@@ -98,4 +117,6 @@ def placeOrder(price):
 if __name__ == "__main__":
     import sys
     input_price = int(sys.argv[1]) if len(sys.argv) > 1 else 22800
-    placeOrder(input_price)
+    # Pass expiry as second argument or default to '20MAY25'
+    input_expiry = sys.argv[2] if len(sys.argv) > 2 else "20MAY25"
+    placeOrder(input_price, input_expiry)
