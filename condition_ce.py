@@ -1,62 +1,147 @@
 import redis
-import pickle
-import SADX as sadx
-from datetime import datetime, timedelta
-import order_ce 
+import time
+from datetime import datetime
+from SmartApi import SmartConnect
 
-r = redis.StrictRedis(host='localhost', port=6379, db=0)
-open_column = 'O'
-close_column = 'C'
-momentum_column = 'Mom'
-adx='ADX_14'
-rsi='rsi'
-timestamp_column = 'timestamp'
+# Initialize Redis client
+redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
 
-
-
-# def buy_signal_condition(latest_row, prev_latest_row):
-#     print(f"Open: {latest_row[open_column]}, Close: {latest_row[close_column]}")
-#     print(f"Momentum: {latest_row[momentum_column]}")
-#     print(f"RSI Latest: {latest_row[rsi]}, RSI Prev: {prev_latest_row[rsi]}")
-#     print(f"ADX: {latest_row[adx]}")
-#     condition1 = latest_row[open_column] > latest_row[close_column]  # or < for PE
-#     condition2 = -25 < latest_row[momentum_column] < 25
-#     condition3 = (latest_row[rsi] > prev_latest_row[rsi])  # or < for PE
-#     condition4 = latest_row[adx] > 25
-#     print(f"Conditions: {condition1}, {condition2}, {condition3}, {condition4}")
-#     return condition1 and condition2 and condition3 and condition4
-
-def buy_signal_condition(latest_row, prev_latest_row):
-    # TEMPORARILY force True for testing
+def condition(expiry):
+    print("Starting CE condition check...")
+    
+    # Get SmartAPI instance from global scope or recreate it
+    smart_api = SmartConnect(api_key="92XQzi0N")
+    
+    # For testing purposes, force buy signal to True
+    buy_signal = True
     print("Buy signal condition forcibly set to True for testing.")
-    return True
+    
+    # Record buy timestamp
+    buy_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Buy signal timestamp: {buy_timestamp}")
+    
+    if buy_signal:
+        # Get the current market price for base underlying (Nifty)
+        ltp_token = "99926000"  # Nifty 50 token
+        try:
+            ltp_data = smart_api.ltpData("NSE", "Nifty 50", ltp_token)
+            nifty_ltp = int(ltp_data['data']['ltp'])
+            atm_strike = round(nifty_ltp / 50) * 50
+            print(f"Current Nifty price: {nifty_ltp}, ATM strike: {atm_strike}")
+            
+            # Choose the option strike to trade (ATM)
+            strike = atm_strike
+            option_key = f"NIFTY {expiry} {strike} CE"
+            
+            # Get the token for the option
+            option_token = redis_client.get(option_key)
+            if not option_token:
+                print(f"❌ Token not found for {option_key}")
+                
+                # Try to check what's available in Redis
+                print("Available keys in Redis:")
+                for key in redis_client.keys("NIFTY*"):
+                    print(f"- {key.decode('utf-8')}")
+                
+                # Try alternative formats if needed
+                format_key = f"format:{option_key}"
+                original_format = redis_client.get(format_key)
+                if original_format:
+                    option_key = original_format.decode('utf-8')
+                    option_token = redis_client.get(option_key)
+                    if option_token:
+                        print(f"Found token using original format: {option_key}")
+                else:
+                    print("Cannot proceed without option token")
+                    return
+            
+            option_token = option_token.decode('utf-8')
+            
+            # Get the current market price for the option
+            option_ltp_data = smart_api.ltpData("NFO", option_key, option_token)
+            option_ltp = option_ltp_data['data']['ltp']
+            print(f"Option {option_key} current price: {option_ltp}")
+            
+            # Place the order
+            place_order(smart_api, option_key, option_token, "BUY", option_ltp, expiry)
+            
+        except Exception as e:
+            print(f"Error in CE condition: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("CE condition check completed.")
 
+def place_order(smart_api, symbol, token, order_type, price, expiry):
+    """
+    Place an order through SmartAPI
+    
+    Args:
+        smart_api: SmartAPI instance
+        symbol: Option symbol
+        token: Option token
+        order_type: "BUY" or "SELL"
+        price: Option price
+        expiry: Expiry date in format "21MAY25"
+    """
+    print(f"Placing {order_type} order for {symbol} at {price}")
+    
+    try:
+        # Determine exchange based on symbol
+        exchange = "NFO"  # National Stock Exchange F&O
+        
+        # Determine quantity (lot size for Nifty is typically 50)
+        quantity = 50
+        
+        # Order parameters
+        order_params = {
+            "variety": "NORMAL",
+            "tradingsymbol": symbol,
+            "symboltoken": token,
+            "transactiontype": order_type,
+            "exchange": exchange,
+            "ordertype": "MARKET",  # Market order
+            "producttype": "INTRADAY",  # Intraday order
+            "duration": "DAY",
+            "price": "0",  # For market orders
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(quantity)
+        }
+        
+        print("Order parameters:", order_params)
+        
+        # Place the order
+        order_response = smart_api.placeOrder(order_params)
+        print(f"Order placed successfully: {order_response}")
+        
+        # Store the order details in Redis for tracking
+        order_id = order_response.get('data', {}).get('orderid')
+        if order_id:
+            order_key = f"order:{symbol}:{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            order_data = {
+                "order_id": order_id,
+                "symbol": symbol,
+                "token": token,
+                "type": order_type,
+                "price": price,
+                "quantity": quantity,
+                "status": "PLACED",
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "expiry": expiry
+            }
+            # Store as hash
+            for k, v in order_data.items():
+                redis_client.hset(order_key, k, v)
+            
+            print(f"Order details stored in Redis with key: {order_key}")
+            
+    except Exception as e:
+        print(f"Error placing order: {e}")
+        import traceback
+        traceback.print_exc()
 
-def log_buy_signal(price):
-    order_ce.placeOrder(price)
-
-
-def condition():
-    global df
-    retrived_df = r.get('data')
-    df = pickle.loads(retrived_df)
-    df['ADX_14'] = sadx.SADX(df)
-
-    last_timestamp = df['timestamp'].iloc[-1]
-    last_timestamp_dt = datetime.strptime(last_timestamp, "%Y-%m-%d %H:%M:%S")
-    now = datetime.now()
-
-    if now - last_timestamp_dt > timedelta(minutes=3):
-        last_index = len(df) - 1
-        prev_last_index = len(df) - 2
-    else:
-        last_index = len(df) - 2
-        prev_last_index = len(df) - 3
-
-    if buy_signal_condition(df.iloc[last_index], df.iloc[prev_last_index]):
-        buy_signal_timestamp = df.iloc[last_index][timestamp_column]
-        print(f"Buy signal timestamp: {buy_signal_timestamp}")
-        log_buy_signal(df.iloc[last_index][close_column])
-        order_ce.placeOrder(df.iloc[last_index][close_column])  # make sure this is your order placement function
-    else:
-        print("[CE] --> No buy signal conditions met.")
+if __name__ == "__main__":
+    # For testing the module directly
+    expiry = redis_client.hget("date", "expiry").decode('utf-8')
+    condition(expiry=expiry)
