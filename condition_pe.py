@@ -6,72 +6,35 @@ from SmartApi import SmartConnect
 # Initialize Redis client
 redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
 
-def condition(expiry):
-    print("Starting PE condition check...")
+def condition(expiry, username):
+    import redis
+    REDIS_CONFIG = {
+        "host": "localhost",
+        "port": 6379,
+        "db": 0
+    }
+    redis_client = redis.StrictRedis(**REDIS_CONFIG)
     
-    # Get SmartAPI instance from global scope or recreate it
-    smart_api = SmartConnect(api_key="92XQzi0N")
+    # Get LTP from stored tokens
+    ltp_key = f"{username}:NIFTY_LTP"
+    ltp = redis_client.get(ltp_key)
+    if not ltp:
+        print(f"⚠️ No LTP found for {username}")
+        return []
     
-    # For testing purposes, force buy signal to True
-    buy_signal = True
-    print("Buy signal condition forcibly set to True for testing.")
+    ltp = int(float(ltp.decode('utf-8')))
+    base_strike = round(ltp / 50) * 50
     
-    # Record buy timestamp
-    buy_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"Buy signal timestamp: {buy_timestamp}")
+    # Select at-the-money (ATM) PE strike
+    atm_strike = base_strike
+    symbol = f"NIFTY {expiry} {atm_strike} PE"
     
-    if buy_signal:
-        # Get the current market price for base underlying (Nifty)
-        ltp_token = "99926000"  # Nifty 50 token
-        try:
-            ltp_data = smart_api.ltpData("NSE", "Nifty 50", ltp_token)
-            nifty_ltp = int(ltp_data['data']['ltp'])
-            atm_strike = round(nifty_ltp / 50) * 50
-            print(f"Current Nifty price: {nifty_ltp}, ATM strike: {atm_strike}")
-            
-            # Choose the option strike to trade (ATM)
-            strike = atm_strike
-            option_key = f"NIFTY {expiry} {strike} PE"
-            
-            # Get the token for the option
-            option_token = redis_client.get(option_key)
-            if not option_token:
-                print(f"❌ Token not found for {option_key}")
-                
-                # Try to check what's available in Redis
-                print("Available keys in Redis:")
-                for key in redis_client.keys("NIFTY*"):
-                    print(f"- {key.decode('utf-8')}")
-                
-                # Try alternative formats if needed
-                format_key = f"format:{option_key}"
-                original_format = redis_client.get(format_key)
-                if original_format:
-                    option_key = original_format.decode('utf-8')
-                    option_token = redis_client.get(option_key)
-                    if option_token:
-                        print(f"Found token using original format: {option_key}")
-                else:
-                    print("Cannot proceed without option token")
-                    return
-            
-            option_token = option_token.decode('utf-8')
-            
-            # Get the current market price for the option
-            option_ltp_data = smart_api.ltpData("NFO", option_key, option_token)
-            option_ltp = option_ltp_data['data']['ltp']
-            print(f"Option {option_key} current price: {option_ltp}")
-            
-            # Place the order
-            place_order(smart_api, option_key, option_token, "BUY", option_ltp, expiry)
-            
-        except Exception as e:
-            print(f"Error in PE condition: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    print("PE condition check completed.")
-
+    # Verify token exists
+    if redis_client.get(f"{username}:{symbol}"):
+        return [symbol]
+    else:
+        print(f"⚠️ PE condition: No token for {symbol}")
+        return []
 def place_order(smart_api, symbol, token, order_type, price, expiry):
     """
     Place an order through SmartAPI
