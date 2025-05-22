@@ -237,97 +237,93 @@ def fetch_ltp(smart_api_conn):
 def store_option_tokens(smart_api_conn, expiry, username):
     """
     Fetches Nifty option details for a given expiry and stores them in Redis.
-    This includes symbol token, full trading symbol, and lot size.
-    
-    Args:
-        smart_api_conn: An authenticated SmartConnect object (used to fetch LTP).
-        expiry (str): The selected expiry date in 'DDMONYY' format (e.g., '25MAY22').
-        username (str): The username (used for Redis key prefixing).
-        
-    Returns:
-        bool: True if tokens were stored, False otherwise.
     """
     print(f"📦 Storing Nifty option tokens for {username} and expiry {expiry}")
     try:
         response = requests.get(TOKEN_URL)
         response.raise_for_status()
-        df = pd.DataFrame(response.json())
+        data = response.json()
 
-        expiry_obj = datetime.strptime(expiry, '%d%b%y').date()
+        if not data:
+            print("❌ Scrip master JSON is empty.")
+            return False
+
+        df = pd.DataFrame(data)
+
+        required_columns = ['token', 'symbol', 'lotsize', 'expiry', 'exch_seg', 'instrumenttype', 'strike']
+        if not all(col in df.columns for col in required_columns):
+            print(f"❌ Missing required columns in scrip master: {required_columns}")
+            return False
+
         df['expiry'] = df['expiry'].astype(str)
         df['expiry_date'] = pd.to_datetime(df['expiry'], format='%d%b%Y', errors='coerce')
 
         df['strike_numeric'] = pd.to_numeric(df['strike'], errors='coerce')
         df['token'] = df['token'].astype(str)
         df['lotsize'] = df['lotsize'].astype(str)
-        
-        # Filter for relevant Nifty options
+
         df_filtered_options = df[
             (df['exch_seg'].str.upper() == 'NFO') &
             (df['instrumenttype'].str.upper() == 'OPTIDX') &
             (df['symbol'].str.startswith('NIFTY', na=False)) &
-            (df['expiry_date'].dt.date == expiry_obj) &
+            (df['expiry_date'].notna()) &
             (df['strike_numeric'].notna()) &
             (df['strike_numeric'] > 0)
         ].copy()
 
         if df_filtered_options.empty:
-            print(f"❌ No NIFTY option data found for expiry {expiry} after filtering. This might mean the expiry is invalid or no options exist for it.")
+            print(f"❌ No NIFTY option data found in scrip master for any expiry.")
             return False
 
-        # Calculate strike in actual points (strike / 100 might be needed if strike is in paise)
-        # Based on your data, 'strike' seems to be in paise, so /100 is correct for comparison
+        try:
+            expiry_obj = datetime.strptime(expiry, '%d%b%y').date()
+        except ValueError:
+            print(f"❌ Invalid expiry format: {expiry}. Expected DDMMMYY (e.g., 29MAY25).")
+            return False
+
+        df_filtered_options = df_filtered_options[
+            df_filtered_options['expiry_date'].dt.date == expiry_obj
+        ]
+
+        if df_filtered_options.empty:
+            print(f"❌ No NIFTY options found for expiry {expiry}. Available expiries: {sorted(df['expiry_date'].dt.date.dropna().unique())}")
+            return False
+
         df_filtered_options['strike_scaled'] = df_filtered_options['strike_numeric'] / 100
-        
-        ltp = fetch_ltp(smart_api_conn) # Fetch LTP using the authenticated SmartConnect
+
+        ltp = fetch_ltp(smart_api_conn)
         if not ltp:
             print(f"❌ Failed to fetch LTP for {SYMBOL}. Cannot determine ATM strikes.")
             return False
 
-        redis_client.set(f"{username}:NIFTY_LTP", ltp) # Store LTP in Redis
+        redis_client.set(f"{username}:NIFTY_LTP", ltp)
 
-        # Determine a range of strikes around the current LTP
-        # Nifty strikes are usually in multiples of 50
         base_strike = round(ltp / 50) * 50
-        
         strikes = df_filtered_options['strike_scaled'].unique()
-        # Consider strikes within a reasonable range (e.g., +/- 1500 points from ATM)
-        # This helps in filtering out illiquid or irrelevant far OTM/ITM options
         strikes_in_range = [s for s in strikes if base_strike - 1500 <= s <= base_strike + 1500]
         strikes_in_range = sorted(strikes_in_range)
-        
+
         if not strikes_in_range:
-            print(f"⚠️ No relevant strikes found within ±1500 of LTP ({ltp}) for expiry {expiry}. Check scrip master or LTP.")
+            print(f"⚠️ No strikes found within ±1500 of LTP ({ltp}) for expiry {expiry}.")
             return False
-            
+
         stored = 0
         for option_type in ['CE', 'PE']:
             for strike_val in strikes_in_range:
-                # Construct the expected trading symbol prefix for matching
-                # Example: NIFTY25MAY24800CE or NIFTY22MAY2524800CE (your log shows 22MAY25)
-                # It's crucial to match the format precisely from the JSON
-                # Using df_filtered_options['symbol'].str.contains instead of startswith for flexibility
-                
-                # Create a regex pattern to find the exact symbol for the strike and type
-                # Example: NIFTY22MAY2524800CE -> NIFTY{expiry}{strike}{option_type}
-                # Angel One symbols might have '0' padding for strikes, so match the number
-                # Regex to match NIFTY, expiry, (optional zeros)strike, and option_type
-                # Example: NIFTY22MAY25024800CE or NIFTY22MAY2524800CE
-                pattern = r"NIFTY" + re.escape(expiry) + r"0*" + str(int(strike_val)) + option_type
-                
+                strike_int = int(strike_val)
+                pattern = rf"NIFTY{expiry}{strike_int}{option_type}"
+
                 match_row = df_filtered_options[
-                    df_filtered_options['symbol'].str.contains(pattern, regex=True, na=False)
+                    df_filtered_options['symbol'].str.match(pattern, na=False)
                 ]
-                
+
                 if not match_row.empty:
-                    # Take the first match if multiple exist (unlikely for exact strike)
                     match_data = match_row.iloc[0]
                     token = match_data['token']
                     trading_symbol = match_data['symbol']
                     lotsize = match_data['lotsize']
-                    
-                    # Redis key format: "NIFTY {EXPIRY} {STRIKE} {TYPE}" (e.g., "NIFTY 25MAY22 17500 CE")
-                    redis_symbol_key = f"NIFTY {expiry} {int(strike_val)} {option_type}"
+
+                    redis_symbol_key = f"NIFTY {expiry} {strike_int} {option_type}"
 
                     redis_client.set(f"{username}:{redis_symbol_key}", token)
                     redis_client.set(f"{username}:format:{redis_symbol_key}", trading_symbol)
@@ -335,9 +331,14 @@ def store_option_tokens(smart_api_conn, expiry, username):
                     print(f"✅ Stored {username}:{redis_symbol_key} -> Token: {token}, Trading Symbol: {trading_symbol}, Lot Size: {lotsize}")
                     stored += 1
                 else:
-                    print(f"⚠️ No exact match found for {option_type} strike {int(strike_val)} for expiry {expiry}. Pattern: {pattern}")
-        
-        return stored > 0
+                    print(f"⚠️ No match found for {option_type} strike {strike_int} for expiry {expiry}. Pattern: {pattern}")
+
+        if stored == 0:
+            print(f"❌ No tokens stored for {username} and expiry {expiry}. Check scrip master or pattern matching.")
+            return False
+
+        return True
+
     except requests.RequestException as e:
         print(f"❌ Network error fetching token data from {TOKEN_URL}: {e}")
         return False
@@ -360,39 +361,60 @@ def run_strategy(user_config, expiry, smart_api_conn):
     username = user_config['username']
     print(f"▶️ Running strategies for {username} with expiry {expiry}")
     
+    # Verify Redis connectivity
+    try:
+        redis_client.ping()
+    except redis.ConnectionError as e:
+        print(f"❌ Redis connection failed for {username}: {e}")
+        return
+
     # --- CE Order Logic ---
     try:
-        # Get symbols from condition logic (defined in conditions.py)
         ce_symbols = conditions.get_ce_symbols_from_condition(expiry=expiry, username=username)
         print(f"📋 CE symbols identified by condition: {ce_symbols}")
         
         for symbol in ce_symbols:
-            # Basic check for expiry consistency (though conditions.py should handle this)
             if expiry not in symbol:
                 print(f"⚠️ Symbol {symbol} has incorrect expiry, expected {expiry}. Skipping.")
                 continue
             
-            # Place order using the function from orders.py, passing the authenticated connection
-            success, result = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
+            # Convert trading symbol to Redis key format (e.g., NIFTY29MAY2524500CE -> NIFTY 29MAY25 24500 CE)
+            match = re.match(r"NIFTY(\d{2}\w{3}\d{2})(\d+)(CE|PE)", symbol)
+            if not match:
+                print(f"⚠️ Invalid symbol format: {symbol}. Skipping.")
+                continue
+            expiry_part, strike, option_type = match.groups()
+            redis_symbol_key = f"NIFTY {expiry_part} {int(strike)} {option_type}"
             
-            if success:
-                print(f"✅ CE order placed for {symbol}: Order ID {result}")
-            # Handle specific API error codes for re-login (e.g., session expired)
-            elif result == "AG8001" or (isinstance(result, str) and "0521" in result and len(result) > 6): # '0521...' are often session errors
-                print(f"🔄 Encountered session error ({result}) for {symbol}. Attempting to re-login for {username}...")
-                new_smart_api_conn = login_user(user_config) # Attempt re-login
-                if new_smart_api_conn:
-                    smart_api_conn = new_smart_api_conn # Update the connection object for subsequent calls
-                    print(f"✅ Re-login successful for {username}. Retrying order placement for {symbol}...")
-                    success_retry, result_retry = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
-                    if success_retry:
-                        print(f"✅ CE order placed (retry) for {symbol}: Order ID {result_retry}")
+            token = redis_client.get(f"{username}:{redis_symbol_key}")
+            if not token:
+                print(f"⚠️ No token found for {symbol} in Redis (key: {username}:{redis_symbol_key}). Skipping.")
+                redis_keys = redis_client.keys(f"{username}:NIFTY*")
+                print(f"🔍 Available Redis keys for {username}: {[k.decode('utf-8') for k in redis_keys]}")
+                continue
+            
+            for attempt in range(3):
+                success, result = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
+                
+                if success:
+                    print(f"✅ CE order placed for {symbol}: Order ID {result}")
+                    break
+                elif result == "AG8001" or (isinstance(result, str) and "0521" in result):
+                    print(f"🔄 Encountered session error ({result}) for {symbol}. Attempt {attempt + 1}/3. Re-logging in...")
+                    new_smart_api_conn = login_user(user_config)
+                    if new_smart_api_conn:
+                        smart_api_conn = new_smart_api_conn
+                        print(f"✅ Re-login successful for {username}.")
                     else:
-                        print(f"⚠️ Failed to place CE order (retry) for {symbol}: {result_retry}")
+                        print(f"❌ Re-login failed for {username}. Skipping order for {symbol}.")
+                        break
                 else:
-                    print(f"❌ Re-login failed for {username}. Cannot retry order for {symbol}.")
-            else:
-                print(f"⚠️ Failed to place CE order for {symbol}: {result}")
+                    print(f"⚠️ Failed to place CE order for {symbol}: {result}")
+                    if attempt < 2:
+                        print(f"🔄 Retrying order placement for {symbol} (Attempt {attempt + 2}/3)...")
+                        time.sleep(1)
+                    else:
+                        print(f"❌ Max retries reached for {symbol}. Skipping.")
     except Exception as e:
         print(f"❌ An unexpected error occurred in CE order logic for {username}: {e}")
         import traceback
@@ -408,25 +430,43 @@ def run_strategy(user_config, expiry, smart_api_conn):
                 print(f"⚠️ Symbol {symbol} has incorrect expiry, expected {expiry}. Skipping.")
                 continue
             
-            success, result = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
+            # Convert trading symbol to Redis key format
+            match = re.match(r"NIFTY(\d{2}\w{3}\d{2})(\d+)(CE|PE)", symbol)
+            if not match:
+                print(f"⚠️ Invalid symbol format: {symbol}. Skipping.")
+                continue
+            expiry_part, strike, option_type = match.groups()
+            redis_symbol_key = f"NIFTY {expiry_part} {int(strike)} {option_type}"
             
-            if success:
-                print(f"✅ PE order placed for {symbol}: Order ID {result}")
-            elif result == "AG8001" or (isinstance(result, str) and "0521" in result and len(result) > 6):
-                print(f"🔄 Encountered session error ({result}) for {symbol}. Attempting to re-login for {username}...")
-                new_smart_api_conn = login_user(user_config)
-                if new_smart_api_conn:
-                    smart_api_conn = new_smart_api_conn
-                    print(f"✅ Re-login successful for {username}. Retrying order placement for {symbol}...")
-                    success_retry, result_retry = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
-                    if success_retry:
-                        print(f"✅ PE order placed (retry) for {symbol}: Order ID {result_retry}")
+            token = redis_client.get(f"{username}:{redis_symbol_key}")
+            if not token:
+                print(f"⚠️ No token found for {symbol} in Redis (key: {username}:{redis_symbol_key}). Skipping.")
+                redis_keys = redis_client.keys(f"{username}:NIFTY*")
+                print(f"🔍 Available Redis keys for {username}: {[k.decode('utf-8') for k in redis_keys]}")
+                continue
+            
+            for attempt in range(3):
+                success, result = orders.place_option_order(smart_api_conn, username, symbol, quantity_multiplier=1, transaction_type="BUY")
+                
+                if success:
+                    print(f"✅ PE order placed for {symbol}: Order ID {result}")
+                    break
+                elif result == "AG8001" or (isinstance(result, str) and "0521" in result):
+                    print(f"🔄 Encountered session error ({result}) for {symbol}. Attempt {attempt + 1}/3. Re-logging in...")
+                    new_smart_api_conn = login_user(user_config)
+                    if new_smart_api_conn:
+                        smart_api_conn = new_smart_api_conn
+                        print(f"✅ Re-login successful for {username}.")
                     else:
-                        print(f"⚠️ Failed to place PE order (retry) for {symbol}: {result_retry}")
+                        print(f"❌ Re-login failed for {username}. Skipping order for {symbol}.")
+                        break
                 else:
-                    print(f"❌ Re-login failed for {username}. Cannot retry order for {symbol}.")
-            else:
-                print(f"⚠️ Failed to place PE order for {symbol}: {result}")
+                    print(f"⚠️ Failed to place PE order for {symbol}: {result}")
+                    if attempt < 2:
+                        print(f"🔄 Retrying order placement for {symbol} (Attempt {attempt + 2}/3)...")
+                        time.sleep(1)
+                    else:
+                        print(f"❌ Max retries reached for {symbol}. Skipping.")
     except Exception as e:
         print(f"❌ An unexpected error occurred in PE order logic for {username}: {e}")
         import traceback
